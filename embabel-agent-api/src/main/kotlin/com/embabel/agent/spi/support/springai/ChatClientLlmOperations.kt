@@ -25,6 +25,7 @@ import com.embabel.agent.spi.ToolDecorator
 import com.embabel.agent.spi.support.LlmDataBindingProperties
 import com.embabel.common.ai.model.Llm
 import com.embabel.common.ai.model.ModelProvider
+import com.embabel.common.ai.model.timeout
 import com.embabel.common.textio.template.TemplateRenderer
 import com.fasterxml.jackson.databind.DatabindException
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -43,6 +44,9 @@ import org.springframework.stereotype.Service
 import java.lang.reflect.ParameterizedType
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * Properties for the ChatClientLlmOperations operations
@@ -102,12 +106,30 @@ internal class ChatClientLlmOperations(
 
         val chatOptions = llm.optionsConverter.convertOptions(interaction.llm)
         return dataBindingProperties.retryTemplate(interaction.id.value).execute<O, DatabindException> {
-            val callResponse = chatClient
-                .prompt(springAiPrompt)
-                // Try to lock to correct overload. Method overloading is evil.
-                .toolCallbacks(interaction.toolCallbacks)
-                .options(chatOptions)
-                .call()
+            val timeout = interaction.llm.timeout
+            val callResponse = if (timeout != null) {
+                val future = CompletableFuture.supplyAsync {
+                    chatClient
+                        .prompt(springAiPrompt)
+                        // Try to lock to correct overload. Method overloading is evil.
+                        .toolCallbacks(interaction.toolCallbacks)
+                        .options(chatOptions)
+                        .call()
+                }
+                try {
+                    future.get(timeout.toMillis(), TimeUnit.MILLISECONDS)
+                } catch (e: java.util.concurrent.TimeoutException) {
+                    future.cancel(true)
+                    throw TimeoutException("LLM request timed out after ${timeout.toMillis()}ms")
+                }
+            } else {
+                chatClient
+                    .prompt(springAiPrompt)
+                    // Try to lock to correct overload. Method overloading is evil.
+                    .toolCallbacks(interaction.toolCallbacks)
+                    .options(chatOptions)
+                    .call()
+            }
             if (outputClass == String::class.java) {
                 val chatResponse = callResponse.chatResponse()
                 chatResponse?.let { recordUsage(llm, it, llmRequestEvent) }
@@ -184,24 +206,54 @@ internal class ChatClientLlmOperations(
         )
         val chatOptions = llm.optionsConverter.convertOptions(interaction.llm)
         return dataBindingProperties.retryTemplate(interaction.id.value).execute<Result<O>, DatabindException> {
-            val responseEntity: ResponseEntity<ChatResponse, MaybeReturn<*>> = chatClient
-                .prompt(springAiPrompt)
-                .toolCallbacks(interaction.toolCallbacks)
-                .options(chatOptions)
-                .call()
-                .responseEntity<MaybeReturn<*>>(
-                    ExceptionWrappingConverter(
-                        expectedType = MaybeReturn::class.java,
-                        delegate = WithExampleConverter(
-                            delegate = SuppressThinkingConverter(
-                                BeanOutputConverter(typeReference, objectMapper)
-                            ),
-                            outputClass = outputClass as Class<MaybeReturn<*>>,
-                            ifPossible = true,
-                            generateExamples = shouldGenerateExamples(interaction),
+            val timeout = interaction.llm.timeout
+            val responseEntity: ResponseEntity<ChatResponse, MaybeReturn<*>> = if (timeout != null) {
+                val future = CompletableFuture.supplyAsync {
+                    chatClient
+                        .prompt(springAiPrompt)
+                        .toolCallbacks(interaction.toolCallbacks)
+                        .options(chatOptions)
+                        .call()
+                        .responseEntity<MaybeReturn<*>>(
+                            ExceptionWrappingConverter(
+                                expectedType = MaybeReturn::class.java,
+                                delegate = WithExampleConverter(
+                                    delegate = SuppressThinkingConverter(
+                                        BeanOutputConverter(typeReference, objectMapper)
+                                    ),
+                                    outputClass = outputClass as Class<MaybeReturn<*>>,
+                                    ifPossible = true,
+                                    generateExamples = shouldGenerateExamples(interaction),
+                                )
+                            )
+                        )
+                }
+                try {
+                    future.get(timeout.toMillis(), TimeUnit.MILLISECONDS)
+                } catch (e: java.util.concurrent.TimeoutException) {
+                    future.cancel(true)
+                    throw TimeoutException("LLM request timed out after ${timeout.toMillis()}ms")
+                }
+            } else {
+                chatClient
+                    .prompt(springAiPrompt)
+                    .toolCallbacks(interaction.toolCallbacks)
+                    .options(chatOptions)
+                    .call()
+                    .responseEntity<MaybeReturn<*>>(
+                        ExceptionWrappingConverter(
+                            expectedType = MaybeReturn::class.java,
+                            delegate = WithExampleConverter(
+                                delegate = SuppressThinkingConverter(
+                                    BeanOutputConverter(typeReference, objectMapper)
+                                ),
+                                outputClass = outputClass as Class<MaybeReturn<*>>,
+                                ifPossible = true,
+                                generateExamples = shouldGenerateExamples(interaction),
+                            )
                         )
                     )
-                )
+            }
             responseEntity.response?.let { recordUsage(llm, it, llmRequestEvent) }
             responseEntity.entity!!.toResult() as Result<O>
         }
